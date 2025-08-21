@@ -1,0 +1,412 @@
+#!/bin/env node
+
+//  Passerelle console & TCP <-> adaptateur USB/série.
+//
+//  Console : édition des commandes avec historique et complétion,
+//            injection de fichiers locaux,
+//            session "façon telnet" avec une station TECHNET.
+//
+//  Serveur TCP : injection de fichiers distants dans une station du
+//                réseau TECHNET.
+//
+//
+//             stdin/
+//             stdout                              Wi-Fi
+//      PC Local |                   LIAISON        UDP
+//                \                   SERIE          |
+//                 )  Technet ap  <----------->  AP  |  <-------> STA
+//                /                                  |  <-------> STA
+//    PC <-----> |                                   |  <-------> STA
+//    PC <-----> |                                   |  <-------> STA
+//              TCP
+//    
+//    Réseau local                                      Réseau TECHNET
+
+
+//  Multiplexage des messages arrivant d'une socket:
+//
+//      * "CONNECT N\r\n": demande de connexion avec la station N
+//
+//         * si la station est déjà connectée, retourne "BUSY\r\n"
+//
+//         * si la station n'est pas déjà connectée:
+//
+//            * envoie un message de contrôle STX
+//
+
+
+import dgram from 'dgram';
+import fs from 'node:fs' ;
+import net from 'node:net' ;
+import path from 'node:path' ;
+import { dirname } from 'path';
+
+import { getSerialPort } from './js/serialport.js';
+import { inject } from './js/inject.js';
+import { recode } from './js/recode.js';
+import { startTcpServer, findAP } from './js/server.js';
+import { terminal } from './js/terminal.js';
+
+import readline from 'node:readline';
+
+
+global.configpath = path.join( import.meta.dirname, 'technet.conf' );
+global.serialport = null ;
+global.tcpserver = null ;
+global.commands = [''] ;
+
+
+//  Charge le fichier de configuration s'il existe.
+//
+global.config = { 'baudrate': 460800,
+		  'serverPort': 39000,
+		  'history': []
+		};
+
+try {
+  const data = JSON.parse( fs.readFileSync( configpath ) );
+  for ( let k of Object.keys(data) )
+    config[k] = data[k] ;
+}
+catch (e) {}
+
+
+//  Récupère l'argument 'baudrate' s'il existe.
+//
+for ( let i=2 ; i<process.argv.length ; i++ )
+  if ( [ '-b', '--baudrate' ].includes(process.argv[i]) ) {
+    config.baudrate = parseInt(process.argv[i+1]) ;
+    process.argv.splice(i,2);
+    break ;
+  }
+
+
+if ( process.argv.length == 2 ) {
+  //
+  //  'technet': console série
+  //
+  serialport = await getSerialPort( config.baudrate );
+  commands.push('print(string.format("%s ID=%X\\n%d heap bytes free.\\n", _VERSION, node.chipid(), node.heap()))');
+  terminal();
+}
+else if ( process.argv.length == 3 && process.argv[2] === 'reset' ) {
+  //
+  //  'technet reset': reset le module attaché au port série
+  //
+  try {
+    serialport = await getSerialPort( config.baudrate );
+    serialport.set({ dtr: false, rts: true });	//  Reset NodeMCU
+    serialport.set({ dtr: false, rts: false });	//  Boot normal
+  }
+  catch(e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+}
+
+else if ( process.argv.length == 3 && process.argv[2] === 'X' ) {
+
+  //  'technet ap': passerelle TCP / Série
+  //
+  //  Passerelle entre des stations TECHNET et des clients du réseau local
+
+
+  //  Sortie des messages de débogage du protocole
+  //
+  const debug = function(){} ;
+  // const debug = console.log ;
+  
+  //  Dictionnaire des clients connectés à une station
+  //
+  //    n° de station => socket client
+  //
+  const clients = {}
+
+
+  //  Ouvre le port série
+  //
+  try {
+    serialport = await getSerialPort( config.baudrate );
+  }
+  catch(e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+
+  //  Lance le serveur TCP
+  //
+  try {
+    tcpserver = await startTcpServer();
+  }
+  catch(e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+
+  //  Messages reçus du port série
+  //    Filtre les messages destinés à un client, commencent par "--N ".
+  //    Envoie les messages au client concerné.
+  //
+  serialport.on('data', data=>{
+    data = data.toString();
+    debug(`SERIN:${data.length}:"${recode(data)}"`);
+
+    const m = data.match(/--([2345]) /);
+    if ( m ) {
+      const station = m[1] ;
+
+      const client = clients[station] ;
+      
+      if ( client ) {
+	const s = data.slice(4);
+	debug(`SOCKOUT:"${recode(s)}"`);
+	client.write( s );
+      }
+      else {
+	// if ( data.slice(4) === '--ETX\r\n' )
+	if ( data.slice(4).startsWith('--ETX\r\n') )
+	  console.log(`Station ${station} a raccroché.\n`);
+	else
+	  console.error(`ERR: no client for station ${station}? ("${data}")`);
+      }
+    }
+  });
+
+
+  tcpserver.on('connection', socket=>{
+
+    // console.log(`CONNEXION de ${socket.remoteAddress}`);
+
+    debug(`SOCKOUT:"TECHNET\\r\\n"`);
+    socket.write('TECHNET\r\n');
+
+    let prefix ;
+    let step = 0 ;
+    let station ;
+
+    //  Messages d'un client
+    //
+    socket.on('data', data=>{
+
+      data = data.toString().trim()
+      debug(`SOCKIN:"${recode(data)}"`);
+
+      //  On commence par récupérer le n° de la station à joindre
+      //
+      if ( step == 0 ) {
+	if ( !data.startsWith('CONNECT ') ) {
+	  debug(`SOCKOUT:"ERR: protocol expected connect instead of ${data}."`);
+	  socket.write(`ERR: protocol expected connect instead of ${data}.`);
+	  socket.end();
+	  return ;
+	}
+
+	station = data.slice(8);
+	if ( station.length != 1 || station<"2" || station>"5" ) {
+	  debug(`SOCKOUT:"ERR: CONNECT station number must be in 2..5 (got ${data})."`);
+	  socket.write(`ERR: CONNECT station number must be in 2..5 (got ${data}).`);
+	  socket.end();
+	  return ;
+	}
+
+	console.log(`Connexion station ${station} <-> ${socket.remoteAddress}.`);
+
+	prefix = `--${station} `;
+	clients[station] = socket ;
+	debug(`SEROUT:"${prefix}--STX\\r\\n"`);
+	serialport.write(`${prefix}--STX\r\n`);
+	step = 1 ;
+	return ;
+      }
+
+      debug(`SEROUT:"${prefix}${data}\\r\\n"`);
+      serialport.write(`${prefix}${data}\r\n`);
+    });
+
+    socket.on('end', () => {
+      delete clients[station] ;
+      console.log(`${socket.remoteAddress} a raccroché.`);
+
+      // Déconnecte la station
+      //
+      debug(`SEROUT:"${prefix}--ETX\\r\\n"`);
+      serialport.write(`${prefix}--ETX\r\n`);
+    });
+  });
+
+
+  // terminal();
+}
+else if ( process.argv.length == 4 && process.argv[2] === 'inject' ) {
+  //
+  //  'technet inject <file>': envoie un fichier à une station locale
+  //
+  if ( !fs.existsSync( process.argv[3] )) {
+    console.error(`"${process.argv[3]}" n'est pas un fichier.`);
+    process.exit(1);
+  }
+
+  let content ;
+  try {
+    content = fs.readFileSync( process.argv[3] )
+  }
+  catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  //  Formate les lignes: pas de fin de ligne, pas de ligne blanche ni de commentaire
+  //
+  const lines = content.toString()
+	.split('\n')
+	.map( line => line.endsWith('\r') ? line.slice(0,-1) : line )
+	.filter( line => line.trim() != '' )
+	.filter( line => !line.trim().startsWith('--') )
+  content = undefined ;
+
+  if ( lines.length == 0 ) {
+    console.log("Rien à transmettre.");
+    process.exit(0);
+  }
+  console.log(`${lines.length} lignes à transmettre.`);
+
+  //  Ouvre le port série
+  //
+  try {
+    serialport = await getSerialPort( config.baudrate );
+  }
+  catch(e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  let step ;
+  let line ;
+  const protocol = {
+
+    start: ()=>{
+      //
+      //  Déclenche l'émission d'un prompt
+      //
+      step = 0 ;
+      serialport.write("\r\n");
+    },
+
+    input: ( data )=>{
+      // console.log(`STEP${step} SERIAL:${data.length}:"${recode(data)}"`);
+
+      if ( step == 0 ) {
+	if ( !data.endsWith('> ') ) {
+	  console.error("ERREUR: pas de prompt.");
+	  process.exit(1);
+	}
+
+	//  Configure l'uart pour ne pas renvoyer les chaînes reçues
+	//
+	step = 1 ;
+	serialport.write( `uart.setup(0,${config.baudrate},8,uart.PARITY_NONE,uart.STOPBITS_1,0)\r\n` );
+	return ;
+      }
+
+      if ( step == 1 ) {
+	//
+	//  Absorbe le flux jusqu'au prompt
+	//
+	if ( !data.endsWith('> ') )
+	  return ;
+	step = 2 ;
+      }
+
+      if ( data.endsWith('> ') ) {
+	//
+	//  prompt -> envoie la ligne suivante
+	//
+	line = lines.shift();
+	if ( line == undefined ) {
+	  console.log("TERMINE");
+	  process.exit(0);
+	}
+
+	console.log( line );
+	serialport.write(line+"\r\n");
+      }
+      else {
+	if ( data.startsWith('Lua error: ') ) {
+	  // console.error( line );
+	  console.error( data );
+	  process.exit(1);
+	}
+	console.error("ERROR");
+	process.exit(1);
+      }
+    }
+  };
+
+  //  Dirige les données arrivant du port série vers le moteur de protocole.
+  //
+  serialport.on('data', data=>{ protocol.input( data.toString() ); });
+
+  protocol.start();
+
+  //  Empêche la fin prématurée du processus, sauf Ctrl+C
+  //
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  rl.on('SIGINT', ()=>{ process.exit(0); });
+}
+else if ( process.argv.length == 5 && process.argv[2] === 'inject' ) {
+  //
+  //  'technet inject <n> <file>': envoie un fichier à la station distante n
+  //
+  const n = Math.abs(parseInt( process.argv[3], 10 ));
+  if ( n.toString() !== process.argv[3] ) {
+    console.error(`${process.argv[3]} n'est pas un numéro de station.`);
+    process.exit(1);
+  }
+
+  if ( !fs.existsSync( process.argv[4] )) {
+    console.error(`"${process.argv[4]}" n'est pas un fichier.`);
+    process.exit(1);
+  }
+
+  let lines = [] ;
+
+  try {
+    lines = fs.readFileSync( process.argv[4] ).toString().split('\n');
+    // console.log(lines);
+  }
+  catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
+  // inject( "192.168.1.26", 8000, n, lines );
+
+  let hp ;
+  try {
+    hp = await findAP();
+  }
+  catch ( e ) {
+    if ( e.message == "timeout" )
+      console.error("Temps d'attente dépassé.");
+    else
+      console.error(e)
+    process.exit(1);
+  }
+
+  const { host, port } = hp ;
+
+  console.log(`Connexion à ${host}:${port}...`);
+
+  inject( host, port, n, lines );
+}
+else {
+  console.error(`Usage:
+
+    technet                     console module local
+    technet X                   serveur passerelle
+    technet inject <file>       injecte le fichier dans le module local
+    technet inject <n> <file>   injecte le fichier dans le module distant n
+`);
+}

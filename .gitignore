@@ -1,0 +1,12 @@
+*#
+*.bak
+*.bak?
+*~
+.#*
+MEMO*
+TODO*
+node_modules/
+nodemcu-firmware/
+package-lock.json
+private/
+rem/
