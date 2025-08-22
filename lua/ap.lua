@@ -251,13 +251,14 @@ end
 --
 function updateDisplay()
 
-   --  Animation "-"
+   --  Animation "-"		TODO: optimisable
+   --    area: 48;20 95;20
    --
    local x = (ticks % 16)*3
    display:setDrawColor(0)
-   display:drawLine( 50, 20, 97, 20 )
+   display:drawHLine( 48, 20, 48 )		-- efface
    display:setDrawColor(1)
-   display:drawLine( 50+x, 20, 52+x, 20 )
+   display:drawHLine( 48+x, 20, 3, 20 )		-- trace
    display:updateDisplayArea( 6, 2, 6, 1 );	-- 8px units!
 
    display:setFont(u8g2.font_6x10_tf)
@@ -281,15 +282,19 @@ function updateDisplay()
    end
 
    --  État des stations (tous les 500ms)
+   --    area: 92;0 128;12
    --
    if ticks%5 == 0 then
-      display:setFont(u8g2.font_9x18B_tf) -- base line at 11
-      local x = 90
+      local x = 92
+      display:setDrawColor(0)
+      display:drawBox( x, 0, 36, 12 )		-- efface
+      display:setDrawColor(1)
+      display:setFont(u8g2.font_9x18B_tf)	-- base line at 11
       for i=2,5 do
 	 local ip = "192.168.4."..i
 	 local s = state[ip] or 0
 	 if s == 0 then
-	    display:drawLine( x+2, 7, x+6, 7 )	-- tiret
+	    display:drawHLine( x+2, 7, 5 )	-- tiret
 	 elseif s == 1 then
 	    display:drawStr( x, 0, i )		-- n° de station
 	 elseif s > 1 then
