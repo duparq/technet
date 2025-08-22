@@ -10,3 +10,4 @@ nodemcu-firmware/
 package-lock.json
 private/
 rem/
+technet.conf

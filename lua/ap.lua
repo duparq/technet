@@ -21,22 +21,64 @@
 --   * l'adresse de l'émetteur indiqué par la socket permet de déterminer la
 --     station N à l'origine du message.
 --
---      * Si la station est connectée à un client, state=3, le message est
+--      * Si la station est connectée à un client (state==3) le message est
 --        envoyé sur le port série avec le préfixe "--N ".
 --
---      * Si la station n'est connectée à un client, state=1, le message est
---        envoyé sur le port série (sauf si c'est un ACK puisque c'est la
---        réponse à un ENQ).
+--      * Si la station n'est pas connectée à un client (state==1) le message
+--        est envoyé sur le port série (sauf si c'est un ACK puisque c'est la
+--        réponse à un ENQ qui permet de déterminer qu'une station est active).
 --
 --      * Si la station est dans un autre état, un message d'information est
 --        envoyé sur le port série.
 --
+
+--  Compilation :  ./nodemcu-firmware/luac.cross -o ap.lc lua/ap.lua 
+--  Installation : nodemcu-tool -p /dev/ttyUSB0 -b 460800 upload ap.lc 
+--  Suppression depuis NodeMcu : > file.remove("ap.lc")
 
 
 --  TODO:
 --   *  supprimer le codage en dur "192.168.4"
 
 
+node.setcpufreq(node.CPU160MHZ)
+
+t0 = 0		-- dernier tmr:now()
+h0 = 0		-- dernier node.heap()
+ticks = 0	-- nombre d'appels à ontick
+
+
+--  Table des stations ayant émis au moins un message
+--    Clé: adresse IP
+--    Valeur: âge du dernier message, en nombre de pings.
+--
+pings = {}
+
+
+--  Table des états des stations
+--    Clé: adresse IP
+--    Valeur:
+--      * nil:
+--      * 0:
+--      * 1: disponible (répond aux pings)
+--      * 2: STX envoyé (demande ouverture telnet)
+--      * 3: STX reçu (telnet établi)
+--      * 4: ETX envoyé (demande de fin de telnet)
+--
+--  Une station dont le state est > 1 ne doit pas être "pinguée".
+--
+state = {}
+
+
+--  Messages de contrôle
+--
+STX="[STX]"		--  Start of text (début de session "telnet")
+ETX="[ETX]"		--  End of text (fin de session "telnet")
+ENQ="[ENQ]"		--  Enquiry (PING)
+ACK="[ACK]"		--  Acknowledge (PING, OK...)
+NAK="[NAK]"		--  Negative acknowledge
+--
+--
 --  Autre possibilité pour les messages de contrôle: utiliser les caractères
 --  ASCII inférieurs à 32 qui ne peuvent pas apparaître dans le code d'un
 --  programme Lua.
@@ -48,16 +90,17 @@
 --    NAK="\21"		--  Negative acknowledge
 
 
---  Messages de contrôle
+--  Apparemment jamais utilisée
 --
-STX="[STX]"		--  Start of text (début de session "telnet")
-ETX="[ETX]"		--  End of text (fin de session "telnet")
-ENQ="[ENQ]"		--  Enquiry (PING)
-ACK="[ACK]"		--  Acknowledge (PING, OK...)
-NAK="[NAK]"		--  Negative acknowledge
+-- node.setonerror (
+--    function(s)
+--       U("\n\nERROR: "..s.."\n\n")
+--       node.restart()
+--    end
+-- )
 
 
-function U(s)		--  Emet s sur la liaison série
+function U(s)		--  Emet s sur la liaison série (sans CRLF)
    uart.write(0,s)
 end
 
@@ -75,39 +118,6 @@ function sanitize(s)
    end
    return table.concat(result)
 end
-
-node.setcpufreq(node.CPU160MHZ)
-
---  Apparemment jamais utilisée
---
--- node.setonerror (
---    function(s)
---       U("\n\nERROR: "..s.."\n\n")
---       node.restart()
---    end
--- )
-
-
---  Table des stations ayant émis au moins un message
---    Clé: adresse IP
---    Valeur: âge du dernier message, en nombre de pings.
---
-pings = {}
-
-X = ""	-- IP de la station connectée ("telnet")
-
---  États des stations (par leur IP, par exemple: 'state["192.168.4.2"]' ):
---
---   * nil:
---   * 0:
---   * 1: disponible (répond aux pings)
---   * 2: STX envoyé (demande ouverture telnet)
---   * 3: STX reçu (telnet établi)
---   * 4: ETX envoyé (demande de fin de telnet)
---
---  Une station dont le state est > 1 ne doit pas être "pinguée".
---
-state = {}
 
 
 --  Crée un réseau Wi-Fi ouvert "TECHNET"
@@ -237,32 +247,58 @@ function sckmsg ( s, data, port, ip )
 end
 
 
+--  Raffraîchit l'affichage. Ne retrace que ce qui a changé.
+--
 function updateDisplay()
-   display:clearBuffer()
-   display:setFont(u8g2.font_9x18B_tf)
 
-   local function stattos ( N )
-      local ip = "192.168.4."..N
-      local s = state[ip] or 0
-      if s == 0 then
-	 s = "-"
-      elseif s == 1 then
-	 s = N
-      elseif s > 1 then
-	 s = "X"
-      end
-      return s
+   --  Animation "-"
+   --
+   local x = (ticks % 16)*3
+   display:setDrawColor(0)
+   display:drawLine( 50, 20, 97, 20 )
+   display:setDrawColor(1)
+   display:drawLine( 50+x, 20, 52+x, 20 )
+   display:updateDisplayArea( 6, 2, 6, 1 );	-- 8px units!
+
+   display:setFont(u8g2.font_6x10_tf)
+
+   --  Uptime, si changé
+   --
+   local t = tmr.time()
+   if t ~= t0 then
+      display:drawStr( 0, 16, string.format("T=%05d", t ))
+      display:updateDisplayArea( 0, 2, 6, 1 );	-- 8px units!
+      t0 = t
    end
 
-   display:drawStr( 0, 0, string.format("TECHNET-X %s%s%s%s",stattos(2),stattos(3),stattos(4),stattos(5) ))
+   --  Heap, si changé
+   --
+   local h = math.floor(node.heap()/1000)
+   if h ~= h0 then
+      display:drawStr( 104, 16, string.format("H=%02d", h))
+      display:updateDisplayArea( 13, 2, 3, 1 );	-- 8px units!
+      h0 = h
+   end
 
-   local t = tmr.time()
-   local s = t % 60
-   local m = math.floor(t/60) % 60
-   local h = math.floor(t/3600)
-   display:setFont(u8g2.font_6x10_tf)
-   display:drawStr( 0, 16, string.format("Up %d:%02d:%02d heap:%5d", h, m, s, node.heap()))
-   display:updateDisplayArea( 0, 0, 16, 4 );
+   --  État des stations (tous les 500ms)
+   --
+   if ticks%5 == 0 then
+      display:setFont(u8g2.font_9x18B_tf) -- base line at 11
+      local x = 90
+      for i=2,5 do
+	 local ip = "192.168.4."..i
+	 local s = state[ip] or 0
+	 if s == 0 then
+	    display:drawLine( x+2, 7, x+6, 7 )	-- tiret
+	 elseif s == 1 then
+	    display:drawStr( x, 0, i )		-- n° de station
+	 elseif s > 1 then
+	    display:drawStr( x, 0, "X" )	-- X
+	 end
+	 x = x + 9
+      end
+      display:updateDisplayArea( 11, 0, 5, 2 );	-- 8px units!
+   end
 end
 
 
@@ -280,15 +316,15 @@ function ping ( )
    for mac,ip in pairs(wifi.ap.getclient()) do
       -- U(string.format("%s\r\n",ip))
 
-      -- if ip ~= X then -- ne dérange la station en session "telnet"
-      if (state[ip] or 0) < 2 then
+      if (state[ip] or 0) >= 2 then
+	 pings[ip] = 0	-- station en telnet, raz le nombre de pings
+      else
 	 local n = pings[ip] or 0
 	 -- U(string.format("ENQ%d %s\r\n",n,ip))
 	 if n < 5 then
 	    --
-	    --  Ajoute 1 au compte de pings une fois le datagramme envoyé
+	    --  Ping la station
 	    --
-	    -- socket:send( 1, ip, ENQ, function() pings[ip] = n + 1 end )
 	    socket:send( 1, ip, ENQ )
 	    pings[ip] = n + 1
 	 else
@@ -324,33 +360,33 @@ display:setFontRefHeightExtendedText()
 display:setDrawColor(1)
 display:setFontPosTop()
 display:setFontDirection(0)
+display:clearBuffer()
+display:setFont(u8g2.font_9x18B_tf)
+display:drawStr( 0, 0, "TECHNET-X")
+display:sendBuffer()
 
 
 --  Tâches répétées
 --
--- ncalls = 0
-timer = tmr.create()
-
-function ontimer ( )
-   -- ncalls = ncalls + 1
-   -- if ncalls == 2 then updateDisplay() end
-   -- if ncalls == 4 then
+function ontick ( )
+   ticks = ticks + 1
    updateDisplay()
-   ping()
-   --    ncalls = 0
-   -- end
-   -- collectgarbage("setstepmul", 250)
-   collectgarbage()
-   timer:start()
+   if ticks%5 == 0 then
+      ping()
+      collectgarbage()
+   end
+   ticker:start()
 end
 
-timer:register( 500, tmr.ALARM_SEMI, ontimer )
-timer:start()
+ticker = tmr.create()
+ticker:register( 100, tmr.ALARM_SEMI, ontick )
+ticker:start()
 
---  En dernier pour ne pas perturber :inject
---
+
 --  Dirige les messages provenant du port série vers la fonction de traitement
 --   * attend une ligne complète
 --   * n'envoie pas de copie à Lua, sinon interprétation en double !
 --  	
+--  NOTE: en dernier pour ne pas perturber :inject
+--
 uart.on( "data",'\n', srlmsg, 0 )
